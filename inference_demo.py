@@ -1,65 +1,69 @@
-from subway_demo_env import SubwayCoolingEnv
-from stable_baselines3 import PPO
-from collections import Counter
-import numpy as np
+"""
+ppo_subway_inference.py  –  SubwayCoolingEnv v2 추론 스크립트
+──────────────────────────────────────────────────────────────
+· action: MultiDiscrete([7, 5]) → ΔT(-2~+2), ΔF(-2~+2)
+· env.info 에서 ac_temp, ac_fan, votes, mean_vote 등을 직접 읽어와 로그 작성
+"""
 
-# 투표 값 → 레이블 매핑
+from collections import Counter
+
+from stable_baselines3 import PPO
+from subway_demo_env import SubwayCoolingEnv
+
+# ────────────────────── 투표 레이블/풍량 레이블 ──────────────────────
 VOTE_LABELS = {
     -2: "매우춥다",
     -1: "약간춥다",
      0: "보통이다",
      1: "약간덥다",
-     2: "매우덥다"
+     2: "매우덥다",
 }
 
-TEMP_VALUES = list(np.arange(18.0, 31.0, 1.0))  # 총 13단계
-FAN_VALUES = [0.5, 1.0, 1.5]                    # 총 3단계
+FAN_LABELS = ["약", "약중", "중", "중강", "강"]  # ac_fan = 0‥4
 
-def format_action(action):
-    temp_idx, fan_idx = action
-    temp_val = TEMP_VALUES[temp_idx]
-    fan_val = FAN_VALUES[fan_idx]
-    return f"(온도 설정: {temp_val:.1f}°C, 풍량: {fan_val:.1f}단계)"
 
-# 환경 및 모델 로드
+def fmt_action(t: int, f: int) -> str:
+    """현재 AC 설정을 문자열로 변환"""
+    return f"{t:2d}°C / 풍량 {f}단({FAN_LABELS[f]})"
+
+
+# ───────────────────────────── main ──────────────────────────────
 env = SubwayCoolingEnv()
 model = PPO.load("ppo_subway_v3", env=env)
 
-n_eval_episodes = 1
+N_EPISODES = 20
+cur_temp, cur_fan = 25, None # 나중에 건너서 받기
 
-for episode in range(n_eval_episodes):
-    obs, _ = env.reset()
+for ep in range(N_EPISODES):
+    ext_temp = 30           # °C
+    ext_hum  = 48.0            # %
+    obs, _ = env.reset(outside_temp=ext_temp,
+                       outside_humidity=ext_hum, ac_temp=cur_temp, ac_fan=cur_fan)
     done = False
-    total_reward = 0
+    total_r = 0.0
 
-    prev_action = (env.ac_temp, env.ac_fan)
+    prev_temp, prev_fan = env.ac_temp, env.ac_fan
 
-    print(f"\n🔁 [Episode {episode + 1} 시작]")
-    print(f"▶️ 외부 온도: {env.outside_temp:.1f}°C, 습도: {env.outside_humidity:.1f}%")
-    print(f"▶️ 초기 에어컨 설정: 온도 {TEMP_VALUES[env.ac_temp]:.1f}°C / 풍량 {FAN_VALUES[env.ac_fan]:.1f}단계\n")
+    print(f"\n🔁 [Episode {ep + 1}]")
+    print(f"외부 {env.outside_temp:.1f}°C / {env.outside_humidity:.1f}% | "
+          f"초기 설정 → {fmt_action(prev_temp, prev_fan)}\n")
 
-    while not done:
-        action, _ = model.predict(obs, deterministic=True)
-        obs, reward, done, _, info = env.step(action)
-        total_reward += reward
+    #while not done:
+    action, _ = model.predict(obs, deterministic=True)
+    obs, reward, done, _, info = env.step(action)
+    total_r += reward
 
-        temp_idx, fan_idx = action
-        delta_temp = TEMP_VALUES[temp_idx] - TEMP_VALUES[prev_action[0]]
-        delta_fan = FAN_VALUES[fan_idx] - FAN_VALUES[prev_action[1]]
-        prev_action = action
+    cur_temp, cur_fan = info["ac_temp"], info["ac_fan"]
+    d_temp, d_fan = cur_temp - prev_temp, cur_fan - prev_fan
+    prev_temp, prev_fan = cur_temp, cur_fan
 
-        votes = info.get("votes", [])
-        mean_vote = info.get("mean_vote", 0.0)
+    votes = info["votes"]
+    mean_vote = info["mean_vote"]
+    vc = Counter(votes)
+    vote_str = " | ".join(f"{VOTE_LABELS[v]}: {vc.get(v, 0)}" for v in range(-2, 3))
 
-        vote_counter = Counter(votes)
-        vote_summary = " | ".join(
-            f"{VOTE_LABELS[v]}: {vote_counter.get(v, 0)}"
-            for v in range(-2, 3)
-        )
+    print(f"Step {env.current_step:02d} | {vote_str} | Mean {mean_vote:+.2f} | "
+            f"{fmt_action(cur_temp, cur_fan)} | "
+            f"ΔT {d_temp:+.1f}°C, ΔF {d_fan:+d} | R {reward:+.3f}")
 
-        print(f"Step {env.current_step:2d} | {vote_summary} | "
-              f"Mean: {mean_vote:+.2f} | {format_action(action)} | "
-              f"Δ온도: {delta_temp:+.1f}, Δ풍량: {delta_fan:+.1f} | "
-              f"Reward: {reward:.3f}")
-
-    print(f"\n✅ [Episode {episode + 1} 종료] Total Reward: {total_reward:.3f}")
+    print(f"\n✅ Total Reward: {total_r:+.3f}\n")

@@ -2,91 +2,128 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 
-TEMP_VALUES = list(np.arange(18.0, 31.0, 1.0))
-FAN_VALUES = [0.5, 1.0, 1.5]
+#TEMP_VALUES = list(np.arange(18.0, 31.0, 1.0))
+#FAN_VALUES = [0.5, 1.0, 1.5]
 
 class SubwayCoolingEnv(gym.Env):
     metadata = {"render_modes": []}
 
     def __init__(
         self,
-        max_passengers: int = 10,
-        ac_position: np.ndarray = np.array([2.5, 0.0]),
-        sigma: float = 1.0,
-        perceived_temp_limits: tuple = (18, 40),
+        max_votes: int = 10,
+        ac_position: np.ndarray = np.array([0.0, 0.0]),
+        perceived_temp_limits: tuple = (10, 40),
         target_temp: float = 25.0
     ):
         super().__init__()
-        self.max_passengers = max_passengers
+        self.ac_temp = 25
+        self.ac_fan = 2
+        self.prev_ac_temp = self.ac_temp
+        self.prev_ac_fan = self.ac_fan
+
+        self.max_votes = max_votes
         self.ac_position = np.array(ac_position, dtype=np.float32)
-        self.sigma = sigma
         self.temp_min, self.temp_max = perceived_temp_limits
         self.target_temp = target_temp
+        self.passengers_num = 0
 
         self.action_space = spaces.MultiDiscrete([5, 5])  # delta -2~+2 for both temp and fan
 
-        dim = 5 + 2 + max_passengers * 3
-        low = np.array([0.0, 0.0, 0.0, 0.0, 0.0] + 
-                       list(self.ac_position) + 
-                       [0.0, 0.0, -1.5] * max_passengers, dtype=np.float32)
-        high = np.array([23.0, 40.0, 100.0, len(TEMP_VALUES)-1, len(FAN_VALUES)-1] + 
-                        list(self.ac_position) + 
-                        [5.0, 5.0, 1.5] * max_passengers, dtype=np.float32)
+        dim = 4 + 2 + max_votes * 4
+
+        # 외부 온도 / 외부 습도 / 에어컨 설정 온도 / 에어컨 설정 풍량 / 에어컨 위치 (x,y) / 사람들 위치 (x,y) [-7~7][-1~1] / 들어온지얼마(0~5) /평가 (-2~2) 
+        low = np.array([10.0, 0.0, 18, 0] + list(self.ac_position) +  [-7, -1, 0, -2] * max_votes, dtype=np.float32)
+        high = np.array([40.0, 100.0, 31, 4] + list(self.ac_position) + [7, 1, 5, 2] * max_votes, dtype=np.float32)
 
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
-        self.max_steps = 60
-        self.vote_thresholds = [22, 23, 26.5, 28]
+        self.max_steps = 45
+        self.vote_thresholds = [23, 25, 27, 28]
         self.reset()
 
-    def reset(self, seed=None, options=None):
+    def reset(
+        self, *,
+        seed: int | None = None,
+        options=None,
+        ac_temp: int | None = None,
+        ac_fan: int  | None = None,
+        outside_temp: float | None = None,
+        outside_humidity: float | None = None,
+        passengers_num: float | None = None
+    ):
+        """
+        에피소드(1회 시뮬레이션) 초기화
+
+        Parameters
+        ----------
+        ac_temp, ac_fan          : 초기 에어컨 온도(18‥31 °C), 풍량(0‥4단)
+        outside_temp, humidity   : 초기 외기 조건
+        passengers_num           : 탑승객 수 (실수; 내부 로직에선 연속값 사용)
+        seed                     : 난수 시드
+        options                  : Gym 표준 매개변수 (미사용)
+
+        * 각 매개변수가 None 이면 아래 범위에서 난수로 결정됩니다.
+        - ac_temp            : randint(18, 31)   → 18‥30 °C
+        - ac_fan             : randint(0, 5)     → 0‥4 단
+        - outside_temp       : uniform(10, 40)   → 10‥40 °C
+        - outside_humidity   : uniform(0, 100)   →   0‥100 %
+        - passengers_num     : uniform(10, 150)  → 10‥150 명
+        """
         super().reset(seed=seed)
         if seed is not None:
             np.random.seed(seed)
 
-        self.current_step = 0
-        self.total_energy = 0.0
+        # ───────── None → 난수 / 기본값 ─────────
+        self.ac_temp = np.random.randint(18, 31) if ac_temp  is None else int(ac_temp)
+        self.ac_fan  = np.random.randint(0, 5)   if ac_fan   is None else int(ac_fan)
 
-        self.current_time = np.random.randint(6, 22)
-        self.ac_temp_idx = TEMP_VALUES.index(25.0)
-        self.ac_fan_idx = FAN_VALUES.index(1.0)
-        self.prev_ac_temp_idx = self.ac_temp_idx
-        self.prev_ac_fan_idx = self.ac_fan_idx
+        self.outside_temp     = (np.random.uniform(10, 40)
+                                if outside_temp     is None else float(outside_temp))
+        self.outside_humidity = (np.random.uniform(0, 100)
+                                if outside_humidity is None else float(outside_humidity))
 
-        self.ac_temp = TEMP_VALUES[self.ac_temp_idx]
-        self.ac_fan = FAN_VALUES[self.ac_fan_idx]
+        self.passengers_num   = (np.random.uniform(10, 150)
+                                if passengers_num  is None else float(passengers_num))
 
-        self.outside_temp = np.random.uniform(20, 35)
-        self.outside_humidity = np.random.uniform(30, 80)
-        self.room_temp = self._estimate_room_temp()
-        self.passengers = self._generate_passengers()
+        # 이전 설정(변동 패널티 계산용) -- 처음엔 같은 값으로 맞춤
+        self.prev_ac_temp = self.ac_temp
+        self.prev_ac_fan  = self.ac_fan
+
+        # 기타 상태 리셋
+        self.current_step  = 0
+        self.total_energy  = 0.0
+        self.room_temp     = 25.0
+        self.comfort_votes = self._generate_votes()
 
         return self._get_state(), {}
+
 
     def step(self, action):
         temp_delta = action[0] - 2
         fan_delta = action[1] - 2
 
-        self.prev_ac_temp_idx = self.ac_temp_idx
-        self.prev_ac_fan_idx = self.ac_fan_idx
+        
 
-        self.ac_temp_idx = int(np.clip(self.ac_temp_idx + temp_delta, 0, len(TEMP_VALUES) - 1))
-        self.ac_fan_idx = int(np.clip(self.ac_fan_idx + fan_delta, 0, len(FAN_VALUES) - 1))
-
-        self.ac_temp = TEMP_VALUES[self.ac_temp_idx]
-        self.ac_fan = FAN_VALUES[self.ac_fan_idx]
+        # action 취하기 --> 에어컨 온도 바꿈
+        self.ac_temp = int(np.clip(self.ac_temp + temp_delta, 18, 31))
+        self.ac_fan = int(np.clip(self.ac_fan + fan_delta, 0, 4))
 
         self.current_step += 1
-        self.total_energy += (30.0 - self.ac_temp) / 12.0 + (self.ac_fan - 0.5)
-        self.current_time = (self.current_time + 1) % 24
+        temp_diff = abs(self.outside_temp - self.ac_temp)
+        fan_factor = self.ac_fan / 5
+        cooling_power = temp_diff * fan_factor
 
+        self.total_energy += cooling_power * 0.1 #0.1 scailing facotr
+
+        # 에어컨 온도 바꿨으니, 실내 온도 새로 계산
         self.room_temp = self._estimate_room_temp()
-
-        for p in self.passengers:
+    
+        # 승객들의 체감온도를 다시 계산 --> 그 체감온도에 대한 투표(쾌적 지수)
+        for p in self.comfort_votes:
             dist = np.linalg.norm(p["position"] - self.ac_position)
-            attenuation = np.exp(-dist / self.sigma)
+            attenuation = np.exp(-dist / 1)
 
             delta = (
-                (self.room_temp - p["perceived_temp"]) * 0.15 * attenuation + np.random.normal(-0.03, 0.03)
+                (self.room_temp - p["perceived_temp"]) * 0.5 * (0.8+0.2*attenuation) # + np.random.normal(-0.03, 0.03)
             )
             p["perceived_temp"] = np.clip(p["perceived_temp"] + delta, self.temp_min, self.temp_max)
             p["vote"] = self._vote_from_temp(p["perceived_temp"])
@@ -97,32 +134,40 @@ class SubwayCoolingEnv(gym.Env):
 
         obs = self._get_state()
         info = {
-            "time": self.current_time,
-            "votes": [p["vote"] for p in self.passengers],
-            "positions": [p["position"].tolist() for p in self.passengers],
-            "mean_vote": np.mean([p["vote"] for p in self.passengers]),
+            "votes": [p["vote"] for p in self.comfort_votes],
+            "positions": [p["position"].tolist() for p in self.comfort_votes],
+            "mean_vote": np.mean([p["vote"] for p in self.comfort_votes]),
             "comfort_ratio": comfort_ratio,
             "energy_penalty": energy_penalty,
             "overreaction_penalty": overreaction_penalty,
             "reward": reward,
             "ac_temp": self.ac_temp,
-            "ac_fan": self.ac_fan
+            "ac_fan": self.ac_fan,
+            "passengers_num": self.passengers_num
         }
         return obs, reward, terminated, truncated, info
 
-    def _generate_passengers(self):
+    def _generate_votes(self):
         passengers = []
-        n = np.random.randint(3, self.max_passengers + 1)
+        n = np.random.randint(3, self.max_votes + 1)
         for _ in range(n):
-            x, y = np.random.uniform(0.0, 5.0), np.random.uniform(0.0, 5.0)
+            x, y,entertime = np.random.uniform(-7, 7), np.random.uniform(-1, 1.0),np.random.uniform(0,5)
             humidity_factor = self.outside_humidity / 100.0
-            init_temp = ((self.outside_temp - self.target_temp) / 10.0) * (1 + 0.5 * humidity_factor) + np.random.normal(0, 0.1)
+
+            strain = np.linalg.norm(np.array([x, y]) - self.ac_position)
+            atten  = np.exp(-strain / 1)           
+            ac_effect = self.ac_temp * self.ac_fan * atten
+            init_temp =0.9* ( self.room_temp * (entertime/5) + self.outside_temp *((5-entertime)/5) ) + 0.1 * ac_effect
+
             vote = self._vote_from_temp(init_temp)
+
             passengers.append({
                 "position": np.array([x, y], dtype=np.float32),
                 "perceived_temp": np.clip(init_temp, self.temp_min, self.temp_max),
+                "entertime": entertime,
                 "vote": vote
             })
+
         return passengers
 
     def _vote_from_temp(self, t):
@@ -134,32 +179,41 @@ class SubwayCoolingEnv(gym.Env):
         else: return 2
 
     def _estimate_room_temp(self):
-        alpha = 0.8 * self.ac_fan / max(FAN_VALUES)
-        return self.outside_temp * (1 - alpha) + self.ac_temp * alpha
+        return (1+self.passengers_num/600)*self.ac_temp
+        #return self.outside_temp * (1 - alpha) + self.ac_temp * alpha
 
     def _get_state(self):
-        base = [self.current_time, self.outside_temp, self.outside_humidity,
-                self.ac_temp_idx, self.ac_fan_idx, *self.ac_position]
+        base = [self.outside_temp, self.outside_humidity,
+                self.ac_temp, self.ac_fan, *self.ac_position]
         ps = []
-        for p in self.passengers:
+        for p in self.comfort_votes:
             ps.extend(p["position"].tolist())
-            ps.append(p["perceived_temp"])
-        while len(ps) < self.max_passengers * 3:
-            ps.extend([0.0, 0.0, 0.0])
+            #ps.append(p["perceived_temp"])
+            ps.append(p["entertime"])
+            ps.append(p["vote"])
+            
+        while len(ps) < self.max_votes * 4:
+            ps.extend([0.0, 0.0, 0.0, 0.0])
         return np.array(base + ps, dtype=np.float32)
 
     def _calculate_reward(self):
-        votes = [p["vote"] for p in self.passengers]
+        votes = [p["vote"] for p in self.comfort_votes]
         total = len(votes)
 
-        comfort_ratio = sum(1 for p in self.passengers if abs(p["perceived_temp"]) <= 0.5) / total
-        energy_penalty = (30.0 - self.ac_temp) / 12.0 + (self.ac_fan - 0.5)
-        overreaction = (abs(self.ac_temp_idx - self.prev_ac_temp_idx) + abs(self.ac_fan_idx - self.prev_ac_fan_idx)) / 2.0
+        comfort_ratio = sum(1 for p in self.comfort_votes if abs(p["vote"]) == 0) / total
+        
+        temp_diff = abs(self.outside_temp - self.ac_temp)
+        fan_factor = self.ac_fan / 5
+        cooling_power = temp_diff * fan_factor
+        energy_penalty = 0.8 * cooling_power
 
-        too_hot_penalty = sum((p["perceived_temp"] - self.target_temp) ** 2 for p in self.passengers if  self._vote_from_temp(p["perceived_temp"]) > 0 )
-        too_cold_penalty = sum((p["perceived_temp"] - self.target_temp) ** 2 for p in self.passengers if  self._vote_from_temp(p["perceived_temp"]) < 0 )
+        overreaction = (abs(self.ac_temp - self.prev_ac_temp) + abs(self.ac_fan - self.prev_ac_fan)) / 2.0
 
+        too_hot_penalty = sum((p["perceived_temp"] - self.target_temp) ** 2 for p in self.comfort_votes if  self._vote_from_temp(p["perceived_temp"]) > 0 )
+        too_cold_penalty = sum((p["perceived_temp"] - self.target_temp) ** 2 for p in self.comfort_votes if  self._vote_from_temp(p["perceived_temp"]) < 0 )
+        # reward = (1.0 * comfort_ratio - 0.2 * energy_penalty - 0.2 * overreaction)
+        
         reward = (1.0 * comfort_ratio - 0.2 * energy_penalty - 0.2 * overreaction -
-                  0.02 * too_hot_penalty - 0.05 * too_cold_penalty)
-
+                  0.002 * too_hot_penalty - 0.03 * too_cold_penalty)
+        
         return reward, comfort_ratio, None, energy_penalty, overreaction
