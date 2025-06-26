@@ -2,7 +2,7 @@ import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
 
-#TEMP_VALUES = list(np.arange(18.0, 31.0, 1.0))
+#TEMP_VALUES = list(np.arange(22.0, 28.0, 1.0))
 #FAN_VALUES = [0.5, 1.0, 1.5]
 
 class SubwayCoolingEnv(gym.Env):
@@ -32,8 +32,8 @@ class SubwayCoolingEnv(gym.Env):
         dim = 4 + 2 + max_votes * 4
 
         # 외부 온도 / 외부 습도 / 에어컨 설정 온도 / 에어컨 설정 풍량 / 에어컨 위치 (x,y) / 사람들 위치 (x,y) [-7~7][-1~1] / 들어온지얼마(0~5) /평가 (-2~2) 
-        low = np.array([10.0, 0.0, 18, 0] + list(self.ac_position) +  [-7, -1, 0, -2] * max_votes, dtype=np.float32)
-        high = np.array([40.0, 100.0, 31, 4] + list(self.ac_position) + [7, 1, 5, 2] * max_votes, dtype=np.float32)
+        low = np.array([10.0, 0.0, 22, 0] + list(self.ac_position) +  [-7, -1, 0, -2] * max_votes, dtype=np.float32)
+        high = np.array([40.0, 100.0, 28, 4] + list(self.ac_position) + [7, 1, 5, 2] * max_votes, dtype=np.float32)
 
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
         self.max_steps = 45
@@ -55,14 +55,14 @@ class SubwayCoolingEnv(gym.Env):
 
         Parameters
         ----------
-        ac_temp, ac_fan          : 초기 에어컨 온도(18‥31 °C), 풍량(0‥4단)
+        ac_temp, ac_fan          : 초기 에어컨 온도(22‥28 °C), 풍량(0‥4단)
         outside_temp, humidity   : 초기 외기 조건
         passengers_num           : 탑승객 수 (실수; 내부 로직에선 연속값 사용)
         seed                     : 난수 시드
         options                  : Gym 표준 매개변수 (미사용)
 
         * 각 매개변수가 None 이면 아래 범위에서 난수로 결정됩니다.
-        - ac_temp            : randint(18, 31)   → 18‥30 °C
+        - ac_temp            : randint(22, 28)   → 22‥30 °C
         - ac_fan             : randint(0, 5)     → 0‥4 단
         - outside_temp       : uniform(10, 40)   → 10‥40 °C
         - outside_humidity   : uniform(0, 100)   →   0‥100 %
@@ -73,7 +73,7 @@ class SubwayCoolingEnv(gym.Env):
             np.random.seed(seed)
 
         # ───────── None → 난수 / 기본값 ─────────
-        self.ac_temp = np.random.randint(18, 31) if ac_temp  is None else int(ac_temp)
+        self.ac_temp = np.random.randint(22, 28) if ac_temp  is None else int(ac_temp)
         self.ac_fan  = np.random.randint(0, 5)   if ac_fan   is None else int(ac_fan)
 
         self.outside_temp     = (np.random.uniform(10, 40)
@@ -98,14 +98,25 @@ class SubwayCoolingEnv(gym.Env):
 
 
     def step(self, action):
-        temp_delta = action[0] - 2
-        fan_delta = action[1] - 2
+        # ───────── 1. 현재 투표 분포 확인 ─────────
+        votes     = [p["vote"] for p in self.comfort_votes]
+        cold_cnt  = sum(v < 0 for v in votes)    # -2, -1
+        hot_cnt   = sum(v > 0 for v in votes)    # +1, +2
 
-        
+        # 모델이 낸 원본 ΔT·ΔF
+        temp_delta = action[0] - 2               # −2‥+2
+        fan_delta  = action[1] - 2
 
-        # action 취하기 --> 에어컨 온도 바꿈
-        self.ac_temp = int(np.clip(self.ac_temp + temp_delta, 18, 31))
-        self.ac_fan = int(np.clip(self.ac_fan + fan_delta, 0, 4))
+        # ───────── 2. 방향성 강제 ─────────
+        if cold_cnt == 0 and hot_cnt > 0:                 # ‘덥다’가 더 많다 → 온도 ↓
+            temp_delta = min(-1, temp_delta)     # 최대 −1 °C
+        elif cold_cnt > hot_cnt:                   # ‘춥다’가 더 많다 → 온도 ↑
+            temp_delta = max(1, temp_delta)      # 최소 +1 °C
+
+
+        # ───────── 3. 액션 적용 ─────────
+        self.ac_temp = int(np.clip(self.ac_temp + temp_delta, 22, 28))
+        self.ac_fan  = int(np.clip(self.ac_fan  + fan_delta,  0,  4))
 
         self.current_step += 1
         temp_diff = abs(self.outside_temp - self.ac_temp)
@@ -207,25 +218,51 @@ class SubwayCoolingEnv(gym.Env):
         votes = [p["vote"] for p in self.comfort_votes]
         total = len(votes)
 
-        comfort_ratio = sum(1 for p in self.comfort_votes if abs(p["vote"]) == 0) / total
-        
-        temp_diff = abs(self.outside_temp - self.ac_temp)
-        fan_factor = self.ac_fan / 5
-        cooling_power = temp_diff * fan_factor
-        energy_penalty = 0.1 * cooling_power
+        comfort_ratio = sum(v == 0 for v in votes) / total
 
-        overreaction = (0.9 * abs(self.ac_temp - self.prev_ac_temp) + 0.1 * abs(self.ac_fan - self.prev_ac_fan)) 
+        # ───────── 에너지·오버리액션 ─────────
+        temp_diff   = abs(self.outside_temp - self.ac_temp)
+        energy_pen  = 0.2 * temp_diff * (self.ac_fan / 5)          # 살짝 확대
+        overreact   = 0.05 * (
+                        abs(self.ac_temp - self.prev_ac_temp) +
+                        abs(self.ac_fan  - self.prev_ac_fan))
 
-        too_hot_penalty = sum((p["perceived_temp"] - self.target_temp) ** 2 for p in self.comfort_votes if  self._vote_from_temp(p["perceived_temp"]) > 0 )
-        too_cold_penalty = sum((p["perceived_temp"] - self.target_temp) ** 2 for p in self.comfort_votes if  self._vote_from_temp(p["perceived_temp"]) < 0 )
-        # reward = (1.0 * comfort_ratio - 0.2 * energy_penalty - 0.2 * overreaction)
-        
+        # ───────── 투표 통계 ─────────
+        cold_cnt  = sum(v < 0 for v in votes)
+        hot_cnt   = sum(v > 0 for v in votes)
+        delta_T   = self.ac_temp - self.prev_ac_temp               # +면 ↑, −면 ↓
+
+        # ───────── 방향성 보상/벌점 ─────────
+        mean_vote = np.mean(votes)
+        correct   = np.sign(mean_vote) * np.sign(delta_T)          # +1 올바름, -1 반대
+        severity  = min(2.0, abs(mean_vote))                      # 0‥2
+
+        dir_bonus   = +1.0 * severity if correct > 0 else 0.0
+        dir_penalty =  1.0 * severity if correct < 0 else 0.0
+
+        # ───────── “절대 하면 안 되는” 반대 조정 큰 벌점 ─────────
+        big_penalty = 0.0
+        if cold_cnt == 0 and hot_cnt > 0 and delta_T > 0:   # 덥기만 한데 ↑
+            big_penalty = 10.0 * delta_T                    # ΔT 1‥3 → -10‥-30
+        elif hot_cnt == 0 and cold_cnt > 0 and delta_T < 0: # 춥기만 한데 ↓
+            big_penalty = 10.0 * (-delta_T)                 # ΔT -1‥-3 → -10‥-30
+        big_penalty = -big_penalty                          # 보상 항이므로 음수
+
+        # ───────── 지속 추위/더위 페널티 ─────────
+        hot_penalty  = sum((p["perceived_temp"] - self.target_temp) ** 2
+                        for p in self.comfort_votes if p["vote"] > 0)
+        cold_penalty = sum((self.target_temp - p["perceived_temp"]) ** 2
+                        for p in self.comfort_votes if p["vote"] < 0)
+
         reward = (
-            1.75 * comfort_ratio
-            - 0.2 * energy_penalty
-            - 0.075 * overreaction
-            - 0.1 * too_hot_penalty
-            - 0.01 * too_cold_penalty
+            2.0  * comfort_ratio
+            + dir_bonus
+            - dir_penalty
+            - 0.10 * hot_penalty
+            - 0.10 * cold_penalty
+            - energy_pen
+            - overreact
+            + big_penalty            # ★ 절대 반대 조정 시 큰 음수
         )
-        
-        return reward, comfort_ratio, None, energy_penalty, overreaction
+
+        return reward, comfort_ratio, None, energy_pen, overreact

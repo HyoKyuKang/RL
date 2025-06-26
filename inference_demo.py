@@ -29,7 +29,7 @@ def fmt_action(t: int, f: int) -> str:
 
 # ───────────────────────────── main ──────────────────────────────
 env = SubwayCoolingEnv()
-model = PPO.load("ppo_subway_v3", env=env)
+model = PPO.load("ppo_subway_v3_", env=env)
 
 N_EPISODES = 20
 cur_temp, cur_fan = 25, None # 나중에 건너서 받기
