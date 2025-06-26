@@ -1,14 +1,9 @@
 """
-subway_env_v2.py
-────────────────────────────────────────────────────────
-지하철 객실 냉방 제어를 위한 Gymnasium 환경 (강화학습용)
-
-주요 개선 사항
-─────────────
-1. RNG 일원화: self.np_random 사용 → seed 재현성 확보
-2. `terminated`/`truncated` 구분: 타임리밋 도달 시 truncated=True
-3. 보상 계수(K_*) 상수화로 튜닝 편의성 ↑
-4. fan / temp 스케일 편차 보정(0.5 가중치)로 균형 학습
+subway_env_v2.py  (위치 감쇠 버전)
+───────────────────────────────────────────────────────
+state = [time, passengers, comfort, x_pos, y_pos]
+  · x_pos, y_pos ∈ [0,1]  (0.5,0.5 = 객실 가운데)
+  · 끝으로 갈수록 냉방 영향 가중치 w ↑  (여기선 w = 2·d,  d: 중심과의 L∞ 거리)
 """
 
 import numpy as np
@@ -19,37 +14,30 @@ from collections import Counter
 
 
 class SubwayCoolingEnv(gym.Env):
-    """지하철 냉방 환경
-    - comfort ∈ [-1, 1]  (−1: 매우 춥다, 0: 쾌적, +1: 매우 덥다)
-    - action = [temp_level 0-12 → 18-30 ℃,  fan_level 0-4 → 1-5단]
-    """
-
-    # ---------- 보상 계수 --------------------------------------------------
-    K_DIR = -0.2      # 방향성 불일치 패널티
-    K_COMFORT = -0.5  # |comfort|²
-    K_ENERGY = -0.1   # 에너지 사용
-    K_OVER = -0.2     # 과도 조작
+    # ── 보상 계수 ───────────────────────────────────────
+    K_DIR = -0.25
+    K_COMFORT = -0.5
+    K_ENERGY = -0.1
+    K_OVER = -0.2
 
     def __init__(self, max_steps: int = 60):
         super().__init__()
-        # 관측치: [시간(0-23), 승객 수(0-100), comfort(-1-1)]
-        self.observation_space = spaces.Box(
-            low=np.array([0, 0, -1.0], dtype=np.float32),
-            high=np.array([23, 100, 1.0], dtype=np.float32),
-        )
-        # 행동: [temp_level(0-12), fan_level(0-4)]
+
+        # --- 관측 공간: x_pos, y_pos 추가 (0~1) ----------
+        low  = np.array([0, 0, -1.0, 0.0, 0.0], dtype=np.float32)
+        high = np.array([23, 100, 1.0, 1.0, 1.0], dtype=np.float32)
+        self.observation_space = spaces.Box(low, high)
+
+        # --- 행동 공간 ----------------------------------
         self.action_space = spaces.MultiDiscrete([13, 5])
 
         self.max_steps = max_steps
         self.action_counter: Counter[tuple[int, int]] = Counter()
-
-        # RNG
         self.np_random, _ = seeding.np_random(None)
 
-        # 상태 초기화
         self.reset()
 
-    # ---------------------------------------------------------------------
+    # ============= 핵심 로직 =============================================
 
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
@@ -61,42 +49,40 @@ class SubwayCoolingEnv(gym.Env):
         self.total_energy = 0.0
         self.total_overreaction = 0
 
-        self.state = np.array([8, 50, 0.0], dtype=np.float32)  # 초기 상태
+        # 초기 위치: 객실 중앙
+        self.state = np.array([8, 50, 0.0, 0.5, 0.5], dtype=np.float32)
         self.action_counter.clear()
-
         return self.state, {}
 
     # ---------------------------------------------------------------------
 
     def step(self, action):
-        """Gymnasium step"""
-        time, passengers, comfort = self.state
-        temp_level, fan_level = map(int, action)
+        t, passengers, comfort, x_pos, y_pos = self.state
+        tlv, flv = map(int, action)
 
-        # 실제 제어값 (온도 °C, 풍량 단계)
-        temp = 18.0 + temp_level     # 18-30 ℃
-        fan = 1 + fan_level          # 1-5단
+        temp = 18 + tlv
+        fan  = 1 + flv
 
-        # ---------- 체감 온도 변화 ----------------------------------------
-        d_comfort = self._simulate_comfort_change(passengers, comfort, temp, fan)
-        comfort = np.clip(comfort + d_comfort, -1.0, 1.0)
+        # -------- 위치 가중치 w -------------------------------------------
+        #   w = 0 (중앙) → 1 (가장자리)  : L∞ 거리 * 2
+        w = 2.0 * max(abs(x_pos - 0.5), abs(y_pos - 0.5))
+
+        d_comfort = self._simulate_comfort_change(passengers, temp, fan)
+        comfort = np.clip(comfort + d_comfort * (1 + w), -1.0, 1.0)
         if abs(comfort) < 0.3:
             self.num_comfort += 1
 
-        # ---------- 비용 및 패널티 ----------------------------------------
-        energy = abs(temp - 24.0) + abs(fan - 3)
+        # -------- 비용 -----------------
+        energy = abs(temp - 24) + abs(fan - 3)
         self.total_energy += energy
-
         overreaction = int(temp <= 20) + int(temp >= 28) + int(fan == 5)
         self.total_overreaction += overreaction
 
-        # ---------- 방향성 보상 -------------------------------------------
+        # -------- 방향성 보상 ----------
         ideal_tlv, ideal_flv = self._comfort_to_target(comfort)
-        # fan 레벨 스케일이 temp(0-12)에 비해 작으므로 0.5 가중치
-        mismatch = abs(ideal_tlv - temp_level) + 0.5 * abs(ideal_flv - fan_level)
+        mismatch = abs(ideal_tlv - tlv) + 0.5 * abs(ideal_flv - flv)
         dir_reward = self.K_DIR * mismatch * (1 + abs(comfort))
 
-        # ---------- step reward -------------------------------------------
         reward = (
             dir_reward
             + self.K_COMFORT * comfort * comfort
@@ -104,56 +90,46 @@ class SubwayCoolingEnv(gym.Env):
             + self.K_OVER * overreaction
         )
 
-        # ---------- 다음 상태 --------------------------------------------
+        # -------- 다음 상태 ------------
         self.current_step += 1
-        time = (time + 1) % 24
-        passengers = self._simulate_passengers(time)
-        self.state = np.array([time, passengers, comfort], dtype=np.float32)
+        t = (t + 1) % 24
+        passengers = self._simulate_passengers(t)
 
-        # ---------- 종료 조건 --------------------------------------------
-        terminated = False                         # 자연 종료 없음
+        # 위치 임의 이동(예시): ±0.05 무작위
+        x_pos = np.clip(x_pos + self.np_random.uniform(-0.05, 0.05), 0.0, 1.0)
+        y_pos = np.clip(y_pos + self.np_random.uniform(-0.05, 0.05), 0.0, 1.0)
+
+        self.state = np.array([t, passengers, comfort, x_pos, y_pos], dtype=np.float32)
+
+        terminated = False
         truncated = self.current_step >= self.max_steps
-
-        if truncated:  # 에피소드 후 보너스/패널티
+        if truncated:
             comfort_ratio = self.num_comfort / self.max_steps
-            norm_energy = self.total_energy / self.max_steps
-            over_rate = self.total_overreaction / self.max_steps
             reward += (
-                + 1.0 * comfort_ratio
-                - 0.3 * norm_energy
-                - 0.5 * over_rate
+                +1.0 * comfort_ratio
+                -0.3 * (self.total_energy / self.max_steps)
+                -0.5 * (self.total_overreaction / self.max_steps)
             )
 
         return self.state, float(reward), terminated, truncated, {}
 
-    # ================== 내부 함수 =========================================
+    # =================== 헬퍼 ============================================
 
-    def _simulate_passengers(self, t):
-        """시간대별 승객 수 시뮬레이션 (정수 t)"""
-        t = int(t)
-        if 7 <= t <= 9 or 17 <= t <= 19:
+    def _simulate_passengers(self, tt):
+        tt = int(tt)
+        if 7 <= tt <= 9 or 17 <= tt <= 19:
             return self.np_random.integers(60, 100)
         return self.np_random.integers(10, 50)
 
     @staticmethod
-    def _simulate_comfort_change(passengers, comfort, temp, fan):
+    def _simulate_comfort_change(passengers, temp, fan):
         ideal_temp, ideal_fan = 24.0, 3
-        temp_effect = +0.015 * passengers * (temp - ideal_temp)
-        fan_effect = -0.01 * passengers * (fan - ideal_fan)
-        return 0.01 * (temp_effect + fan_effect)
+        temp_eff = +0.015 * passengers * (temp - ideal_temp)
+        fan_eff  = -0.01  * passengers * (fan  - ideal_fan)
+        return 0.01 * (temp_eff + fan_eff)
 
     @staticmethod
-    def _comfort_to_target(comfort: float):
-        """
-        comfort → (temp_level, fan_level) 목표치
-        -1 → temp_lv 10 (28 ℃), fan_lv 0
-        0  → temp_lv  6 (24 ℃), fan_lv 2
-        +1 → temp_lv  2 (20 ℃), fan_lv 4
-        """
-        desired_temp = np.clip(24 - 4 * comfort, 18, 30)
-        temp_level = int(round(desired_temp - 18))
-
-        desired_fan = np.clip(3 + 2 * comfort, 1, 5)
-        fan_level = int(round(desired_fan - 1))
-
-        return temp_level, fan_level
+    def _comfort_to_target(c):
+        temp_lv = int(round(np.clip(24 - 4 * c, 18, 30) - 18))
+        fan_lv  = int(round(np.clip(3 + 2 * c, 1, 5) - 1))
+        return temp_lv, fan_lv
