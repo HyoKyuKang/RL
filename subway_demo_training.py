@@ -1,23 +1,39 @@
 from subway_demo_env import SubwayCoolingEnv
 from stable_baselines3 import PPO
-from stable_baselines3.common.env_checker import check_env
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
+import os
 
-# 환경 생성
+# 1. 환경 설정
 env = SubwayCoolingEnv()
+env = Monitor(env)  # 로그 저장을 위해 Monitor 래핑
 
-# 환경 체크 (에러 확인용)
-check_env(env, warn=True)
+# 2. 모델 설정
+#model = PPO("MlpPolicy", env, verbose=1)
+model = PPO("MlpPolicy", env, verbose=1, tensorboard_log="./tb_logs")
 
-# 모델 생성
-model = PPO("MlpPolicy", env, verbose=1)
+# 3. 콜백: 정기 저장 + 성능 평가
+checkpoint_callback = CheckpointCallback(
+    save_freq=50000,
+    save_path="./checkpoints",
+    name_prefix="ppo_subway"
+)
 
-# 학습 시작t
-model.learn(total_timesteps=100_000)
+eval_env = SubwayCoolingEnv()
+eval_callback = EvalCallback(
+    eval_env,
+    best_model_save_path="./best_model",
+    log_path="./logs",
+    eval_freq=10000,
+    deterministic=True,
+    render=False
+)
 
-# 학습 후 테스트
-obs, _ = env.reset()
-done = False
-while not done:
-    action, _states = model.predict(obs)
-    obs, reward, done, _, info = env.step(action)
-    print(f"Step: {env.current_step}, Reward: {reward:.3f}, Mean Vote: {info['mean_vote']:.2f}")
+# 4. 학습 시작
+model.learn(
+    total_timesteps=1_000_00,  # 시간 늘림
+    callback=[checkpoint_callback, eval_callback]
+)
+
+# 5. 최종 저장
+model.save("ppo_subway_v2")
