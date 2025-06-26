@@ -29,7 +29,7 @@ def fmt_action(t: int, f: int) -> str:
 
 # ───────────────────────────── main ──────────────────────────────
 env = SubwayCoolingEnv()
-model = PPO.load("ppo_subway_v3_", env=env)
+model = PPO.load("ppo_subway_v3", env=env)
 
 N_EPISODES = 20
 cur_temp, cur_fan = 25, None # 나중에 건너서 받기
@@ -53,14 +53,37 @@ for ep in range(N_EPISODES):
     obs, reward, done, _, info = env.step(action)
     total_r += reward
 
-    cur_temp, cur_fan = info["ac_temp"], info["ac_fan"]
-    d_temp, d_fan = cur_temp - prev_temp, cur_fan - prev_fan
-    prev_temp, prev_fan = cur_temp, cur_fan
+       
+   
+    
+
 
     votes = info["votes"]
     mean_vote = info["mean_vote"]
     vc = Counter(votes)
     vote_str = " | ".join(f"{VOTE_LABELS[v]}: {vc.get(v, 0)}" for v in range(-2, 3))
+
+
+    d_temp, d_fan = info["ac_temp"] - prev_temp, info["ac_fan"] - prev_fan
+
+    # 4. 규칙 적용
+    #    vote_sum > 0  → 덥다 의견 우세 → temp_code ↓ (온도 낮춤)
+    #    vote_sum < 0  → 춥다 의견 우세 → temp_code ↑ (온도 높임)
+    if  mean_vote > 0 and d_temp > 0:          # 덥다 → temp_code 1 (ΔT = −1 °C)
+        print("덥다 의견 우세 → 온도 낮춤")
+        action[0] = 1
+        cur_temp, cur_fan = cur_temp-1, info["ac_fan"]
+          
+    elif mean_vote < 0 and d_temp < 0:        # 춥다 → temp_code 3 (ΔT = +1 °C)
+        print("춥다 의견 우세 → 온도 높임")
+        action[0] = 3
+        cur_temp, cur_fan = cur_temp+1, info["ac_fan"]
+    else:
+        cur_temp, cur_fan = info["ac_temp"], info["ac_fan"]
+    
+
+    d_temp, d_fan = cur_temp - prev_temp, cur_fan - prev_fan
+    prev_temp, prev_fan = cur_temp, cur_fan  
 
     print(f"Step {env.current_step:02d} | {vote_str} | Mean {mean_vote:+.2f} | "
             f"{fmt_action(cur_temp, cur_fan)} | "
