@@ -1,104 +1,115 @@
 """
-inference.py ― SubwayCooling PPO (위치·체류·외기상 버전)
-────────────────────────────────────────────────────────
+inference_seq.py ― 연속 시각 · 실시간 set-point 피드백 테스트
+────────────────────────────────────────────────────────────
 state = [time, passengers, comfort, x_pos, y_pos,
-         enter_time, ext_temp, ext_humidity]
+         enter_time, ext_temp, ext_hum,
+         cur_temp_lv, cur_fan_lv]        # ← 10-dim
 
-  · x_pos, y_pos     ∈ [0,1]      (0.5,0.5 = 객실 중앙)
-  · enter_time       ∈ [0,60]     (분 단위 체류 시간)
-  · ext_temp         ∈ [-10,40]℃  (외부 기온)
-  · ext_humidity     ∈ [0,100]%   (외부 상대습도)
-
-VecNormalize 통계 복원 → 학습 시 정규화 일치
-무작위 N(기본 60)개 상태로 추론 → 액션 빈도 요약
+첫 스텝 set-point : 26 ℃(lv=8), 3단(lv=2)
+각 step에서 나온 set-point를 다음 step의 cur_* 로 넘겨
+N step(기본 60) 연속 시뮬레이션 후 set-point 빈도 요약.
 """
 
-import os
-import argparse
+import os, argparse
 import numpy as np
 from collections import Counter
-
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from subway_env_v2 import SubwayCoolingEnv   # 10-dim 환경
 
-from subway_env_v2 import SubwayCoolingEnv   # 8-차원 state 환경
-
-# ── 매핑 상수 ──────────────────────────────────────────
 TEMP_MIN, TEMP_MAX = 18.0, 30.0
-FAN_LEVELS = ["약", "약중", "중", "중강", "강"]
+FAN_KOR = ["약", "약중", "중", "중강", "강"]
 
 MODEL_PATH   = "models/ppo_subway_model_latest"
-VECNORM_PATH = f"{MODEL_PATH}_vecnorm.pkl"
+VEC_PATH     = f"{MODEL_PATH}_vecnorm.pkl"
 
-# ── 환경 / 모델 로드 ───────────────────────────────────
-def _make_env():
+# ─────────────────────────────────────────────────────────
+def make_env():
     return SubwayCoolingEnv()
 
-def load_model_and_env():
-    base = DummyVecEnv([_make_env])
-    if os.path.isfile(VECNORM_PATH):
-        env = VecNormalize.load(VECNORM_PATH, base)
-        env.training, env.norm_reward = False, False
-    else:
-        print("⚠️ VecNormalize 통계 누락 → 정규화 없이 진행")
-        env = base
-    model = PPO.load(MODEL_PATH, env=env, print_system_info=False)
-    return model, env
+base = DummyVecEnv([make_env])
+if os.path.isfile(VEC_PATH):
+    env = VecNormalize.load(VEC_PATH, base)
+    env.training, env.norm_reward = False, False
+else:
+    print("⚠️ VecNormalize 통계 누락 → 정규화 없이 진행")
+    env = base
 
-model, env = load_model_and_env()
+model = PPO.load(MODEL_PATH, env=env, print_system_info=False)
 
-# ── 단일 추론 함수 ────────────────────────────────────
-def run_inference(state: np.ndarray, deterministic: bool = True):
+# ─────────────────────────────────────────────────────────
+def run_inference(state):
     """
-    state shape=(8,)
-      [t, pax, comfort, x, y, enter_time, ext_temp, ext_hum]
+    state: [t, pax, comfort, x, y, stay, extT, extH, cur_tlv, cur_flv]
+    returns: 새 set-point (tlv, flv)
     """
     obs = state.reshape(1, -1)
     if isinstance(env, VecNormalize):
         obs = env.normalize_obs(obs)
 
-    action, _ = model.predict(obs, deterministic=deterministic)
-    tlv, flv = map(int, action[0])
+    act, _ = model.predict(obs, deterministic=True)
+    tlv, flv = map(int, np.asarray(act).squeeze())
 
+    # 변환 & 출력 (모든 입력 변수 + 새 set-point)
     real_temp = TEMP_MIN + (tlv / 12) * (TEMP_MAX - TEMP_MIN)
-    real_fan  = FAN_LEVELS[flv]
-
     print(
-        f"[t={state[0]:02.0f}, pax={state[1]:3.0f}, c={state[2]:+5.2f}, "
-        f"x={state[3]:.2f}, y={state[4]:.2f}, stay={state[5]:4.0f}m, "
-        f"extT={state[6]:5.1f}℃, extH={state[7]:5.1f}%] "
-        f"→ {real_temp:4.1f}℃(lv{tlv:2}), fan {real_fan}({flv})"
+        "⏱ t={:02.0f}h | pax {:3.0f} | c {:+.2f} | xy({:.2f},{:.2f}) | "
+        "stay {:4.1f}m | ext {:5.1f}℃ / {:5.1f}% | "
+        "cur_lv {:2.0f}/{:1.0f} → set {:4.1f}℃(lv{:2}), fan {:}".format(
+            state[0],      # time
+            state[1],      # passengers
+            state[2],      # comfort
+            state[3],      # x_pos
+            state[4],      # y_pos
+            state[5],      # enter_time
+            state[6],      # ext_temp
+            state[7],      # ext_hum
+            state[8],      # cur_temp_lv
+            state[9],      # cur_fan_lv
+            real_temp, tlv, FAN_KOR[flv]   # 새 set-point
+        )
     )
     return tlv, flv
 
-# ── 메인: 무작위 테스트 ────────────────────────────────
+# ─────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-n", "--num", type=int, default=60,
-                        help="무작위 테스트 케이스 수 (default=60)")
-    parser.add_argument("--seed", type=int, default=None,
-                        help="random seed")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-n", "--num", type=int, default=60, help="step 수")
+    ap.add_argument("--seed", type=int, default=None)
+    args = ap.parse_args()
     rng = np.random.default_rng(args.seed)
+
+    # 초기 조건 ----------------------------------------------------------
+    t0 = 0
+    pax = rng.integers(30, 81)
+    comfort = rng.uniform(-0.2, 0.2)
+    x, y = 0.5, 0.5
+    stay = 0.0
+    ext_t, ext_h = 25.0, 50.0
+    cur_tlv, cur_flv = 8, 2    # 26℃·3단
 
     hist = Counter()
 
-    for _ in range(args.num):
-        state = np.array([
-            rng.integers(0, 24),        # time
-            rng.integers(10, 101),      # passengers
-            rng.uniform(-1.0, 1.0),     # comfort
-            rng.uniform(0.0, 1.0),      # x_pos
-            rng.uniform(0.0, 1.0),      # y_pos
-            rng.uniform(0.0, 60.0),     # enter_time (min)
-            rng.uniform(-10.0, 40.0),   # ext_temp  (℃)
-            rng.uniform(0.0, 100.0),    # ext_humidity (%)
-        ], dtype=np.float32)
+    for k in range(args.num):
+        t = (t0 + k) % 24
+        state = np.array([t, pax, comfort, x, y,
+                          stay, ext_t, ext_h,
+                          cur_tlv, cur_flv], dtype=np.float32)
 
         tlv, flv = run_inference(state)
         hist[(tlv, flv)] += 1
 
-    # ── 액션 빈도 요약 ─────────────────────────────────
+        # 다음 step으로 현재 set-point 전달
+        cur_tlv, cur_flv = tlv, flv
+
+        # (예시) 환경 변수 약간 업데이트
+        comfort = np.clip(comfort + rng.normal(0, 0.05), -1, 1)
+        pax = int(np.clip(pax + rng.normal(0, 5), 10, 100))
+        stay = min(stay + 1.0, 60.0)
+        ext_t = np.clip(ext_t + rng.normal(0, 0.3), -10, 40)
+        ext_h = np.clip(ext_h + rng.normal(0, 1.0), 0, 100)
+
+    # 요약 --------------------------------------------------------------
     print("\n―――――― Action frequency ――――――")
     for (tlv, flv), cnt in hist.most_common():
         print(f"temp_lv {tlv:2}, fan_lv {flv} : {cnt}회")

@@ -30,7 +30,7 @@ model = PPO(
 )
 
 # 3. 학습 ------------------------------------------------------------------
-model.learn(total_timesteps=500_000)         # 필요하면 더 늘리기
+model.learn(total_timesteps=100_000)         # 필요하면 더 늘리기
 
 # 4. VecNormalize 스케일 정보까지 같이 저장
 save_path = "models/ppo_subway_model_latest"
