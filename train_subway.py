@@ -1,20 +1,29 @@
 from stable_baselines3 import PPO
-from subway_env import SubwayCoolingEnv
+from subway_env import SubwayCoolingEnv  # 파일명이 subway_env.py가 아닌 경우 수정
 from stable_baselines3.common.env_checker import check_env
+from gymnasium.wrappers import FlattenObservation
+import os
 
-# 환경 생성
-env = SubwayCoolingEnv()
+# 1. 환경 생성 및 flatten
+base_env = SubwayCoolingEnv()
+env = FlattenObservation(base_env)
 
-# 환경 검증 (선택)
+# 2. 환경 검증 (디버깅용)
 check_env(env, warn=True)
 
-# PPO 모델 생성
-model = PPO("MlpPolicy", env, verbose=1)
+# 3. PPO 모델 생성
+model = PPO(
+    policy="MlpPolicy",
+    env=env,
+    verbose=1,
+    tensorboard_log="./tensorboard_logs",  # 선택: 학습 로그 저장
+)
 
-# 학습 실행
-model.learn(total_timesteps=20000)
+# 4. 학습 실행
+model.learn(total_timesteps=100_000)
 
-# 모델 저장
-model.save("ppo_subway_model")
+# 5. 모델 저장
+os.makedirs("models", exist_ok=True)
+model.save("models/ppo_subway_model")
 
-print("학습 완료 및 모델 저장 완료.")
+print("✅ 학습 완료 및 모델 저장 완료.")
