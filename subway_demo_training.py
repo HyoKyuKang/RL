@@ -27,7 +27,7 @@ eval_callback = EvalCallback(
 callback = CallbackList([checkpoint_callback, eval_callback])
 
 model.learn(
-    total_timesteps=100_000,
+    total_timesteps=150_000,
     callback=callback
 )
 

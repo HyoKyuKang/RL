@@ -202,10 +202,10 @@ class SubwayCoolingEnv(gym.Env):
 
         comfort_ratio = sum(1 for p in self.comfort_votes if abs(p["vote"]) == 0) / total
         
-        temp_diff = abs(self.outside_temp - self.ac_temp)
+        temp_diff = abs(self.outside_temp - self.ac_temp) / 10
         fan_factor = self.ac_fan / 5
         cooling_power = temp_diff * fan_factor
-        energy_penalty = 0.8 * cooling_power
+        energy_penalty = cooling_power
 
         overreaction = (abs(self.ac_temp - self.prev_ac_temp) + abs(self.ac_fan - self.prev_ac_fan)) / 2.0
 
@@ -214,6 +214,6 @@ class SubwayCoolingEnv(gym.Env):
         # reward = (1.0 * comfort_ratio - 0.2 * energy_penalty - 0.2 * overreaction)
         
         reward = (1.0 * comfort_ratio - 0.2 * energy_penalty - 0.2 * overreaction -
-                  0.002 * too_hot_penalty - 0.03 * too_cold_penalty)
+                  0.002 * too_hot_penalty - 0.003 * too_cold_penalty)
         
         return reward, comfort_ratio, None, energy_penalty, overreaction
