@@ -180,7 +180,14 @@ class SubwayCoolingEnv(gym.Env):
 
     def _estimate_room_temp(self):
         return (1+self.passengers_num/600)*self.ac_temp
-        #return self.outside_temp * (1 - alpha) + self.ac_temp * alpha
+        # return self.outside_temp * (1 - alpha) + self.ac_temp * alpha
+    # def _estimate_room_temp(self):
+    #     # α: 냉방효율, β: 외기열부하, γ: 인원열부하
+    #     α = 0.7
+    #     β = 0.3
+    #     γ = 0.0008  # 승객 1명당 0.8 %
+    #     mix = α * self.ac_temp + β * self.outside_temp
+    #     return mix + γ * self.passengers_num
 
     def _get_state(self):
         base = [self.outside_temp, self.outside_humidity,
@@ -205,15 +212,20 @@ class SubwayCoolingEnv(gym.Env):
         temp_diff = abs(self.outside_temp - self.ac_temp)
         fan_factor = self.ac_fan / 5
         cooling_power = temp_diff * fan_factor
-        energy_penalty = 0.8 * cooling_power
+        energy_penalty = 0.1 * cooling_power
 
-        overreaction = (abs(self.ac_temp - self.prev_ac_temp) + abs(self.ac_fan - self.prev_ac_fan)) / 2.0
+        overreaction = (0.9 * abs(self.ac_temp - self.prev_ac_temp) + 0.1 * abs(self.ac_fan - self.prev_ac_fan)) 
 
         too_hot_penalty = sum((p["perceived_temp"] - self.target_temp) ** 2 for p in self.comfort_votes if  self._vote_from_temp(p["perceived_temp"]) > 0 )
         too_cold_penalty = sum((p["perceived_temp"] - self.target_temp) ** 2 for p in self.comfort_votes if  self._vote_from_temp(p["perceived_temp"]) < 0 )
         # reward = (1.0 * comfort_ratio - 0.2 * energy_penalty - 0.2 * overreaction)
         
-        reward = (1.0 * comfort_ratio - 0.2 * energy_penalty - 0.2 * overreaction -
-                  0.002 * too_hot_penalty - 0.03 * too_cold_penalty)
+        reward = (
+            1.75 * comfort_ratio
+            - 0.2 * energy_penalty
+            - 0.075 * overreaction
+            - 0.1 * too_hot_penalty
+            - 0.01 * too_cold_penalty
+        )
         
         return reward, comfort_ratio, None, energy_penalty, overreaction
