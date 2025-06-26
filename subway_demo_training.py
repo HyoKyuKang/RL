@@ -36,4 +36,4 @@ model.learn(
 )
 
 # 5. 최종 저장
-model.save("ppo_subway_v2")
+model.save("ppo_subway_v3")
