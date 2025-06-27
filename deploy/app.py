@@ -25,17 +25,13 @@ def predict():
         # 2. 모델이 제안한 원본 action
         action, _ = model.predict(obs, deterministic=True)   # [temp_code, fan_code]
 
-        # 3. 승객 vote 합계 계산
-        #    vote 위치: obs[9], obs[13], obs[17], …  (4칸마다 한 번)
-        vote_sum = obs[9::4].sum()      # 패딩된 0은 합계에 영향 없음
-
-        # 4. 규칙 적용
-        #    vote_sum > 0  → 덥다 의견 우세 → temp_code ↓ (온도 낮춤)
-        #    vote_sum < 0  → 춥다 의견 우세 → temp_code ↑ (온도 높임)
-        if vote_sum > 0 and action[0] > 2:          # 덥다 → temp_code 1 (ΔT = −1 °C)
+        vote_sum = obs[9::4].sum()     
+        if vote_sum > 0 and action[0] >= 2:        
             action[0] = 1
-        elif vote_sum < 0 and action[0] < 2:        # 춥다 → temp_code 3 (ΔT = +1 °C)
+        elif vote_sum < 0 and action[0] <= 2:       
             action[0] = 3
+        elif vote_sum == 0:
+            action[0] = 2
 
         # ─────────────────────────────────────────────
         print(f"[REQUEST]  state  = {obs}")
